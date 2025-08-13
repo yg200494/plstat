@@ -1,10 +1,9 @@
 # app.py — Powerleague Stats (Streamlit + Supabase)
 # Mobile-first, admin-only writes, CSV import/export, drag-order lineups, avatars (HEIC→PNG).
-# Fixes:
-# - Duplicate key crash in Matches (unique keys per tab)
-# - FotMob-style green pitch rendering
-# - Drag-and-drop ordering (add/edit)
-# - Full Player Profile page with nemesis + best teammate
+# Fixes in this version:
+# - Player Profile crash (removed non-existent descending= param)
+# - FotMob-style pitch that honors formation strings like "1-2-1", "1-3-2-1"
+# - Unique keys per widget/tab
 # - NaN-safe CSV import; avatar join hot-fix
 
 import io
@@ -287,11 +286,24 @@ def export_table_csv(table: str, filename: str):
 def kpi(label: str, value: str):
     st.metric(label, value)
 
-def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str], team_label: str):
+def _parse_formation(formation: Optional[str]) -> Optional[List[int]]:
     """
-    Render a simple FotMob-style green pitch:
+    Converts '1-2-1' -> [1,2,1]. Returns None if empty/invalid.
+    """
+    if not formation or not isinstance(formation, str):
+        return None
+    parts = [p.strip() for p in formation.split("-") if p.strip().isdigit()]
+    if not parts:
+        return None
+    nums = [max(1, min(6, int(p))) for p in parts]
+    return nums
+
+def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str], team_label: str, formation: Optional[str]):
+    """
+    Render a FotMob-style green pitch using formation when available.
     - GK row (single)
-    - Outfield rows grouped by 'line' then 'slot'
+    - Outfield rows per formation counts (top→bottom)
+    Fallback: use 'line' grouping if formation is missing.
     """
     # Style wrapper
     st.markdown(
@@ -300,16 +312,17 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
         .pitch {
             background: #0b6e0b;
             border-radius: 16px;
-            padding: 10px 10px 4px 10px;
+            padding: 12px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.12);
             color: white;
+            margin-bottom: 10px;
         }
-        .pitch .row { margin: 6px 0; }
         .chip { font-size: 12px; opacity: 0.95; }
         .card {
             background: rgba(255,255,255,0.10);
             border-radius: 12px;
             padding: 6px 8px;
+            text-align: center;
         }
         </style>
         """,
@@ -329,12 +342,13 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
     if "id_y" in df.columns:
         df = df.drop(columns=["id_y"])
 
+    # GK
     gk = df[df["is_gk"]==True].copy()
-    out = df[df["is_gk"]==False].copy()
+    out = df[df["is_gk"]==False].copy().sort_values(["slot","player_name"])
 
-    # GK single row
+    # draw single GK line
+    st.markdown('<div class="pitch">', unsafe_allow_html=True)
     if not gk.empty:
-        st.markdown('<div class="pitch">', unsafe_allow_html=True)
         for _, r in gk.iterrows():
             star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
             c = st.columns([1,5], vertical_alignment="center")
@@ -345,15 +359,19 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
                     st.markdown("🧤")
             with c[1]:
                 st.markdown(f"<div class='card'><b>{r['player_name']}{star}</b><div class='chip'>{chip(r['goals'], r['assists'])}</div></div>", unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-    # Outfield grouped by 'line'
-    if not out.empty:
-        for ln, sub in out.groupby("line"):
-            sub = sub.sort_values(["slot","player_name"])
-            st.markdown('<div class="pitch">', unsafe_allow_html=True)
-            cols = st.columns(len(sub)) if len(sub) > 0 else st.columns(1)
-            for col, (_, r) in zip(cols, sub.iterrows()):
+    # Outfield rows
+    rows_counts = _parse_formation(formation)
+    if rows_counts:
+        # use formation to split ordered outfielders into rows
+        idx = 0
+        for count in rows_counts:
+            row_players = out.iloc[idx: idx+count]
+            idx += count
+            if row_players.empty:
+                continue
+            cols = st.columns(len(row_players))
+            for col, (_, r) in zip(cols, row_players.iterrows()):
                 with col:
                     star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
                     if photos_on and r.get("photo_url"):
@@ -361,7 +379,33 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
                     else:
                         st.markdown("👟")
                     st.markdown(f"<div class='card'><b>{r['player_name']}{star}</b><div class='chip'>{chip(r['goals'], r['assists'])}</div></div>", unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+        # If extra outfielders remain (e.g., formation not set yet), put them in last row
+        if idx < len(out):
+            row_players = out.iloc[idx:]
+            cols = st.columns(len(row_players))
+            for col, (_, r) in zip(cols, row_players.iterrows()):
+                with col:
+                    star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
+                    if photos_on and r.get("photo_url"):
+                        st.image(r["photo_url"], width=48)
+                    else:
+                        st.markdown("👟")
+                    st.markdown(f"<div class='card'><b>{r['player_name']}{star}</b><div class='chip'>{chip(r['goals'], r['assists'])}</div></div>", unsafe_allow_html=True)
+    else:
+        # fallback: group by 'line'
+        if not out.empty:
+            for ln, sub in out.groupby("line"):
+                sub = sub.sort_values(["slot","player_name"])
+                cols = st.columns(len(sub)) if len(sub) > 0 else st.columns(1)
+                for col, (_, r) in zip(cols, sub.iterrows()):
+                    with col:
+                        star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
+                        if photos_on and r.get("photo_url"):
+                            st.image(r["photo_url"], width=48)
+                        else:
+                            st.markdown("👟")
+                        st.markdown(f"<div class='card'><b>{r['player_name']}{star}</b><div class='chip'>{chip(r['goals'], r['assists'])}</div></div>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def match_selector(key: str):
     matches = fetch_matches_df()
@@ -470,7 +514,7 @@ def compute_duos(min_games_together=3):
     )
     grp = grp[grp["GP"]>=int(min_games_together)].copy()
     grp["Win%"] = (grp["W"]/grp["GP"]).round(3)
-    return grp.sort_values("Win%", descending=False).sort_values("Win%", ascending=False)
+    return grp.sort_values("Win%", ascending=False)
 
 def compute_duo_ga_per_game():
     """Combined G+A per game for pairs on SAME team."""
@@ -515,16 +559,13 @@ def compute_nemesis_for_player(pid: str) -> pd.DataFrame:
         if L.empty: continue
         if pid not in L["player_id"].values:
             continue
-        # find player's team
         my_row = L[L["player_id"]==pid].iloc[0]
         my_team = my_row["team"]
         opp_team = "Bibs" if my_team=="Non-bibs" else "Non-bibs"
-        # result from my team perspective
         a, b = int(m["score_a"]), int(m["score_b"])
         my_score = a if my_team==m["team_a"] else b
         opp_score = b if my_team==m["team_a"] else a
         res = "D" if (bool(m.get("is_draw")) or my_score==opp_score) else ("W" if my_score>opp_score else "L")
-        # accumulate vs each opponent on the other team
         for _, opp in L[L["team"]==opp_team].iterrows():
             rows.append((opp["player_id"], opp["player_name"], res))
     if not rows:
@@ -599,10 +640,10 @@ def page_matches():
                 c1, c2 = st.columns(2)
                 with c1:
                     nb = L[L["team"]=="Non-bibs"]
-                    fotmob_pitch(nb, photos_on, m.get("motm_name"), "Non-bibs")
+                    fotmob_pitch(nb, photos_on, m.get("motm_name"), "Non-bibs", m.get("formation_a"))
                 with c2:
                     bb = L[L["team"]=="Bibs"]
-                    fotmob_pitch(bb, photos_on, m.get("motm_name"), "Bibs")
+                    fotmob_pitch(bb, photos_on, m.get("motm_name"), "Bibs", m.get("formation_b"))
 
     # --- Add/Edit ---
     with tab2:
@@ -679,18 +720,15 @@ def page_matches():
             for team in ["Non-bibs","Bibs"]:
                 st.markdown(f"### {team}")
                 tdf = la[la["team"]==team].copy()
-                # Build two lists: GK [single] and Outfield (names)
                 if tdf.empty:
                     st.info("No players for this team yet.")
                     continue
                 gk_name = tdf[tdf["is_gk"]==True]["player_name"].tolist()
                 if not gk_name and not tdf.empty:
-                    # force first as GK if none marked
                     gk_name = [tdf.iloc[0]["player_name"]]
                 out_names = [n for n in tdf["player_name"].tolist() if n not in gk_name]
                 st.caption("Outfield order (left→right):")
                 new_order = sort_items(out_names, direction="horizontal", key=f"edit_sort_{team}_{m['id']}")
-                # Inline GA + slot edits
                 for _, r in tdf.iterrows():
                     c = st.columns([3,1,1,1])
                     with c[0]:
@@ -705,13 +743,9 @@ def page_matches():
                     with c[2]:
                         st.number_input("A", min_value=0, value=int(r["assists"]), key=f"a_{r['id']}")
                     with c[3]:
-                        # Slot will be recomputed from drag order for outfielders on save
                         st.number_input("Slot", min_value=1, value=int(r["slot"]), key=f"s_{r['id']}")
-                # Save button applies both drag order and field edits
                 if st.button(f"Save {team}", key=f"btn_save_{team}_{m['id']}"):
-                    # persist GA, GK and slot updates
                     tdf_now = fetch_lineups_by_match(m["id"])
-                    # compute target slots from new_order (GK slot=1, outfield slots follow)
                     slot_map: Dict[str,int] = {}
                     slot_map[gk_name[0]] = 1 if gk_name else 1
                     for i, name in enumerate(new_order, start=2):
@@ -762,7 +796,6 @@ def page_players():
     if players.empty:
         st.info("No players yet.")
     else:
-        # Gallery + admin edit controls
         for _, r in players.iterrows():
             with st.container():
                 row = st.columns([1,3,3,2])
@@ -848,7 +881,6 @@ def page_player_profile():
         me = L[L["player_id"]==pid]
         if me.empty: continue
         r = me.iloc[0]
-        # result
         a, b = int(m["score_a"]), int(m["score_b"])
         my_team = r["team"]
         my_score = a if my_team==m["team_a"] else b
@@ -879,8 +911,6 @@ def page_player_profile():
     A_ = int(A["assists"].sum())
     GA = G + A_
     winp = round(W/GP, 3) if GP else 0.0
-    gpg = round(G/GP, 3) if GP else 0.0
-    apg = round(A_/GP, 3) if GP else 0.0
     gapg = round(GA/GP, 3) if GP else 0.0
 
     c1,c2,c3 = st.columns(3)
@@ -888,10 +918,11 @@ def page_player_profile():
     with c2: st.metric("W‑D‑L", f"{W}-{D}-{L}")
     with c3: st.metric("Win%", f"{winp:.3f}")
 
-    c4,c5,c6 = st.columns(3)
+    c4,c5 = st.columns(2)
     with c4: st.metric("Goals", G)
     with c5: st.metric("Assists", A_)
-    with c6: st.metric("G+A / GM", f"{gapg:.3f}")
+
+    st.metric("G+A / GM", f"{gapg:.3f}")
 
     # Streaks
     def streaks(seq: List[str], target: str) -> Dict[str,int]:
@@ -902,7 +933,6 @@ def page_player_profile():
                 longest = max(longest, curr)
             else:
                 curr = 0
-        # current streak (from end)
         curr2 = 0
         for s in reversed(seq):
             if s == target:
@@ -915,7 +945,7 @@ def page_player_profile():
     ls = streaks(A["res"].tolist(), "L")
     st.caption(f"Streaks — Longest W: {ws['longest']} · Current W: {ws['current']} · Longest L: {ls['longest']} · Current L: {ls['current']}")
 
-    # Best teammate by Win% and by GA/GM
+    # Best teammate (Win%) and GA/GM
     duos = compute_duos(min_games_together=2)
     duo_ga = compute_duo_ga_per_game()
     best_win = None
