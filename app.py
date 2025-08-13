@@ -1,10 +1,11 @@
 # app.py — Powerleague Stats (Streamlit + Supabase)
-# Production-friendly, mobile-first.
-# New in this build:
-# - FotMob-style pitch with absolute positioning & responsive avatars
-# - Awards empty-state fix + explicit POTM/MOTM add forms
-# - Removed ball emoji from title & sidebar
-# - NaN-safe CSV import, drag-and-drop, nemesis/duos, avatar HEIC→PNG
+# UI-polished build:
+# - Eye-candy FotMob-style pitch (gradient turf, pitch markings)
+# - Better spacing (GK offset), larger GA chips, clean avatars
+# - MOTM normalization & star on pitch + banner chip
+# - Edit Match: date picker + scoreline/MOTM/formation
+# - Awards add forms (POTM/MOTM), robust empty-state handling
+# - NaN-safe CSV import, drag & drop lineups, avatars (HEIC→PNG)
 
 import io
 from typing import Tuple, Optional, List, Dict
@@ -16,6 +17,7 @@ from PIL import Image
 from pillow_heif import read_heif
 from streamlit_sortables import sort_items
 from supabase import create_client, Client
+from datetime import date as date_cls
 
 # -----------------------
 # Config & Clients
@@ -132,7 +134,6 @@ def fetch_awards(season: Optional[int]=None) -> pd.DataFrame:
         q = q.eq("season", season)
     res = q.order("season").order("month").order("gw").execute()
     df = pd.DataFrame(res.data or [])
-    # Ensure stable empty schema
     if df.empty:
         df = pd.DataFrame(columns=["id","season","month","type","gw","player_id","player_name","notes"])
     return df
@@ -143,7 +144,29 @@ def clear_cache():
     fetch_lineups_by_match.clear()
     fetch_awards.clear()
 
+# Aliases for imports
 ALIAS = {"Ani": "Anirudh Gautam", "Abdullah Y13": "Mohammad Abdullah"}
+
+# --- MOTM normalization (map short token -> full canonical name if unique)
+def normalize_to_full_name(token: Optional[str]) -> Optional[str]:
+    token = (token or "").strip()
+    if not token:
+        return None
+    players = fetch_players_df()
+    # Exact match first
+    exact = players[players["name"].str.lower() == token.lower()]
+    if len(exact) == 1:
+        return exact.iloc[0]["name"]
+    # Unique first-name match
+    first = players[players["name"].str.split().str[0].str.lower() == token.lower()]
+    if len(first) == 1:
+        return first.iloc[0]["name"]
+    # Unique last-name match
+    last = players[players["name"].str.split().str[-1].str.lower() == token.lower()]
+    if len(last) == 1:
+        return last.iloc[0]["name"]
+    # Fallback: leave as is
+    return token
 
 # -----------------------
 # Storage: image upload / HEIC convert
@@ -263,48 +286,75 @@ def _parse_formation(formation: Optional[str]) -> Optional[List[int]]:
 
 def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str], team_label: str, formation: Optional[str], key: str):
     """
-    Absolute-positioned pitch:
-    - 100% width container with fixed aspect ratio (3:4) for mobile.
-    - GK row near top, then formation rows top->bottom.
+    Absolute-positioned pitch with gradient turf and pitch markings.
+    GK spacing improved; larger GA chips.
     """
-    # CSS (scoped via unique key to avoid collisions)
+    # Normalize MOTM to full name for star highlight
+    motm_full = normalize_to_full_name(motm_name)
+
+    # CSS (scoped via unique key)
     st.markdown(f"""
     <style>
     .pitch-{key} {{
         position: relative;
         width: 100%;
         aspect-ratio: 3 / 4;
-        background: #0b6e0b;
+        background: radial-gradient(120% 120% at 50% 0%, #0da60d 0%, #0a7f0a 40%, #0a6d0a 100%);
         border-radius: 16px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+        box-shadow: 0 6px 20px rgba(0,0,0,0.18);
         overflow: hidden;
-        margin-bottom: 10px;
+        margin-bottom: 12px;
     }}
+    /* Pitch markings */
+    .pitch-{key} .mark {{
+        position: absolute; pointer-events: none; opacity: 0.55;
+        border-color: rgba(255,255,255,0.85);
+    }}
+    .pitch-{key} .halfline {{ left: 0; right: 0; top: 50%; height: 2px; background: rgba(255,255,255,0.65); }}
+    .pitch-{key} .center-circle {{ width: 28%; height: 28%; border: 2px solid rgba(255,255,255,0.65); border-radius: 50%; top: 50%; left: 50%; transform: translate(-50%, -50%); }}
+    .pitch-{key} .pen-top {{ left: 12%; right: 12%; top: 6%; height: 16%; border: 2px solid rgba(255,255,255,0.55); border-bottom: none; border-radius: 10px 10px 0 0; }}
+    .pitch-{key} .pen-bot {{ left: 12%; right: 12%; bottom: 6%; height: 16%; border: 2px solid rgba(255,255,255,0.55); border-top: none; border-radius: 0 0 10px 10px; }}
+    .pitch-{key} .goal-top {{ left: 35%; right: 35%; top: 3.5%; height: 4%; border: 2px solid rgba(255,255,255,0.65); border-bottom: none; border-radius: 6px 6px 0 0; }}
+    .pitch-{key} .goal-bot {{ left: 35%; right: 35%; bottom: 3.5%; height: 4%; border: 2px solid rgba(255,255,255,0.65); border-top: none; border-radius: 0 0 6px 6px; }}
+    .team-title-{key} {{ margin: 4px 0 6px; font-weight: 700; }}
     .player-{key} {{
         position: absolute;
         transform: translate(-50%, -50%);
         text-align: center;
         color: #fff;
-        width: clamp(48px, 14vw, 64px);
+        width: clamp(56px, 15vw, 72px);
     }}
     .avatar-{key} {{
         width: 100%;
         aspect-ratio: 1 / 1;
         border-radius: 50%;
-        border: 2px solid rgba(255,255,255,0.85);
+        border: 3px solid rgba(255,255,255,0.95);
         background: rgba(255,255,255,0.15);
         overflow: hidden;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        display: flex; align-items: center; justify-content: center;
         font-size: clamp(18px, 5vw, 26px);
+        box-shadow: 0 3px 10px rgba(0,0,0,0.25);
     }}
-    .name-{key} {{ font-weight: 700; font-size: clamp(10px, 2.8vw, 12px); line-height: 1.1; margin-top: 4px; }}
-    .chip-{key} {{ font-size: clamp(9px, 2.5vw, 11px); opacity: 0.95; }}
+    .name-{key} {{ font-weight: 800; font-size: clamp(11px, 2.9vw, 13px); line-height: 1.1; margin-top: 5px; text-shadow: 0 1px 2px rgba(0,0,0,0.35); }}
+    .chip-{key} {{
+        display: inline-block;
+        margin-top: 3px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(0,0,0,0.35);
+        border: 1px solid rgba(255,255,255,0.25);
+        font-size: clamp(11px, 3.2vw, 13px);
+    }}
+    .motm-badge-{key} {{
+        position: absolute; right: -6px; top: -6px;
+        background: #ffb400; color: #1a1a1a; font-weight: 800;
+        border-radius: 999px; padding: 2px 6px; font-size: 11px; border: 2px solid #fff;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }}
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown(f"#### {team_label}")
+    st.markdown(f"<div class='team-title-{key}'>#### {team_label}</div>", unsafe_allow_html=True)
 
     def chip(g,a):
         parts=[]
@@ -313,7 +363,7 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
         return " · ".join(parts)
 
     # Join player photos
-    P = fetch_players_df()[["id","photo_url"]]
+    P = fetch_players_df()[["id","photo_url","name"]]
     df = team_df.merge(P, left_on="player_id", right_on="id", how="left")
     if "id_y" in df.columns: df = df.drop(columns=["id_y"])
     gk = df[df["is_gk"]==True].copy()
@@ -337,40 +387,46 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
         for _, sub in out.groupby("line"):
             rows.append([r for _, r in sub.sort_values(["slot","player_name"]).iterrows()])
 
-    # Compute y positions (percent) — GK ~12%, then even spacing
+    # Compute y positions (percent)
+    # GK sits ~10–12%; first outfield row around ~32% to create pleasant gap
     total_rows = max(1, len(rows))
     ys = []
     for i in range(total_rows):
-        if i == 0: ys.append(12)  # GK
+        if i == 0: 
+            ys.append(12)  # GK
         else:
-            # distribute remaining 80% of height over remaining rows
-            ys.append(20 + (i-1) * (80 / max(1, total_rows-1)))
+            remaining_rows = max(1, total_rows-1)
+            ys.append(32 + (i-1) * (58 / remaining_rows))  # 32%..90%
 
-    # Render HTML
+    # Render pitch skeleton + players
     html = [f'<div class="pitch-{key}">']
+    html += [
+        f'<div class="mark halfline"></div>',
+        f'<div class="mark center-circle"></div>',
+        f'<div class="mark pen-top"></div>',
+        f'<div class="mark pen-bot"></div>',
+        f'<div class="mark goal-top"></div>',
+        f'<div class="mark goal-bot"></div>',
+    ]
     for row_idx, row_players in enumerate(rows):
         if not row_players: continue
         y = ys[row_idx]
         n = len(row_players)
-        # spread across 10..90% x
-        if n == 1:
-            xs = [50]
-        else:
-            xs = list(np.linspace(15, 85, n))
+        xs = [50] if n==1 else list(np.linspace(15, 85, n))
         for x, r in zip(xs, row_players):
             name = r["player_name"]
-            star = " ⭐" if (motm_name and str(name)==motm_name) else ""
             g = int(r.get("goals",0)); a = int(r.get("assists",0))
             chips = chip(g,a)
+            is_motm = (motm_full and str(name).lower() == str(motm_full).lower())
             if photos_on and r.get("photo_url"):
                 avatar = f'<img src="{r["photo_url"]}" class="avatar-{key}" />'
             else:
-                # GK glove vs boot
                 avatar = f'<div class="avatar-{key}">{"🧤" if bool(r.get("is_gk")) else "👟"}</div>'
             html.append(
                 f'<div class="player-{key}" style="left:{x}%; top:{y}%;">'
                 f'{avatar}'
-                f'<div class="name-{key}">{name}{star}</div>'
+                f'{"<div class=\\"motm-badge-%s\\">★</div>" % key if is_motm else ""}'
+                f'<div class="name-{key}">{name}</div>'
                 f'<div class="chip-{key}">{chips}</div>'
                 f'</div>'
             )
@@ -534,8 +590,10 @@ def page_overview():
 
     st.subheader("Latest Match")
     latest=matches.iloc[-1]
-    st.write(f"**S{latest['season']} GW{int(latest['gw'])}** — {latest['team_a']} {latest['score_a']}–{latest['score_b']} {latest['team_b']}")
-    st.caption(f"MOTM: {latest.get('motm_name') or '—'}  ·  {'Draw' if latest.get('is_draw') else 'Result'}")
+    motm_chip = normalize_to_full_name(latest.get('motm_name'))
+    date_txt = f" · {latest['date']}" if latest.get("date") else ""
+    st.write(f"**S{latest['season']} GW{int(latest['gw'])}** — {latest['team_a']} {latest['score_a']}–{latest['score_b']} {latest['team_b']}{date_txt}")
+    st.caption(f"⭐ MOTM: {motm_chip or '—'}  ·  {'Draw' if latest.get('is_draw') else 'Result'}")
 
     st.divider()
     st.subheader("Leaders (All time)")
@@ -554,8 +612,10 @@ def page_matches():
     with tab1:
         m = match_selector("match_select_summary")
         if m is not None:
+            motm_chip = normalize_to_full_name(m.get("motm_name"))
+            date_txt = f" · {m['date']}" if m.get("date") else ""
             st.subheader(f"S{m['season']} · GW{int(m['gw'])}")
-            st.caption(f"{m['team_a']} vs {m['team_b']} · {m['score_a']}–{m['score_b']} · MOTM: {m.get('motm_name') or '—'}")
+            st.caption(f"{m['team_a']} vs {m['team_b']} · {m['score_a']}–{m['score_b']}{date_txt} · ⭐ MOTM: {motm_chip or '—'}")
             photos_on = st.toggle("Show photos", value=True, key=f"photos_on_{m['id']}")
             L = fetch_lineups_by_match(m["id"])
             if L.empty:
@@ -578,7 +638,7 @@ def page_matches():
         st.subheader("Add Match")
         season = st.number_input("Season", min_value=2024, max_value=2100, value=2025, step=1, key="add_season")
         gw = st.number_input("Gameweek", min_value=1, max_value=200, value=1, step=1, key="add_gw")
-        date = st.date_input("Date", value=None, key="add_date")
+        date_val = st.date_input("Date", value=None, key="add_date")
         side_count = st.selectbox("Side count", [5,6,7], index=0, key="add_side")
         formations = {
             5: ["1-2-1","2-1-1","1-3-0","2-0-2"],
@@ -600,7 +660,7 @@ def page_matches():
             sb_write.table("matches").upsert([{
                 "season": int(season), "gw": int(gw), "side_count": int(side_count),
                 "team_a": "Non-bibs", "team_b": "Bibs", "score_a": 0, "score_b": 0,
-                "date": str(date) if date else None, "motm_name": None, "is_draw": False,
+                "date": str(date_val) if date_val else None, "motm_name": None, "is_draw": False,
                 "formation_a": fa, "formation_b": fb, "notes": None
             }], on_conflict="season,gw").execute()
             clear_cache()
@@ -616,7 +676,7 @@ def page_matches():
                         "player_id": pid_map.get(name), "player_name": name,
                         "is_gk": i==0, "goals": 0, "assists": 0,
                         "line": 0 if i==0 else 1, "slot": 1 if i==0 else i, "position": None
-                    }); 
+                    })
                 return out
             sb_write.table("lineups").delete().eq("match_id", match_id).execute()
             rows = build_rows("Non-bibs", nb_order) + build_rows("Bibs", bb_order)
@@ -661,18 +721,31 @@ def page_matches():
                             "line": 0 if bool(st.session_state.get(f"gk_{r['id']}")) else 1,
                         }).eq("id", r["id"]).execute()
                     clear_cache(); st.success(f"{team} saved.")
-            # Match meta
-            m_motm = st.text_input("MOTM name", value=m.get("motm_name") or "", key="edit_motm")
+
+            # Match meta (score, draw, formations, MOTM, date)
+            m_motm = st.text_input("MOTM name (first/last or full)", value=m.get("motm_name") or "", key="edit_motm")
             m_form_a = st.text_input("Formation A", value=m.get("formation_a") or "", key="edit_fa")
             m_form_b = st.text_input("Formation B", value=m.get("formation_b") or "", key="edit_fb")
             score_a = st.number_input("Score A", min_value=0, value=int(m["score_a"]), key="edit_sa")
             score_b = st.number_input("Score B", min_value=0, value=int(m["score_b"]), key="edit_sb")
             is_draw = st.checkbox("Draw", value=bool(m.get("is_draw")), key="edit_draw")
+            # Date input (supports editing old matches)
+            date_default = None
+            if m.get("date"):
+                try:
+                    date_default = pd.to_datetime(m["date"]).date()
+                except Exception:
+                    date_default = None
+            m_date = st.date_input("Match date", value=date_default, key="edit_date")
             if st.button("Save match meta", key="btn_save_matchmeta"):
                 sb_write.table("matches").update({
-                    "motm_name": (m_motm or None), "formation_a": (m_form_a or None),
-                    "formation_b": (m_form_b or None), "score_a": int(score_a),
-                    "score_b": int(score_b), "is_draw": bool(is_draw)
+                    "motm_name": (m_motm or None),
+                    "formation_a": (m_form_a or None),
+                    "formation_b": (m_form_b or None),
+                    "score_a": int(score_a),
+                    "score_b": int(score_b),
+                    "is_draw": bool(is_draw),
+                    "date": str(m_date) if isinstance(m_date, date_cls) else None
                 }).eq("id", m["id"]).execute()
                 clear_cache(); st.success("Match meta saved."); st.rerun()
 
@@ -840,8 +913,11 @@ def page_stats():
             df = agg.sort_values("Team Contribution%", ascending=False)[["player_name","GP","GA","Team Contribution%","Win%"]]
         st.dataframe(df, hide_index=True, use_container_width=True)
     elif mode == "MOTM":
-        m = fetch_matches_df(); mm = m[m["motm_name"].notnull()]
-        df = mm.groupby("motm_name", as_index=False).agg(MOTM=("motm_name","count"))
+        m = fetch_matches_df()
+        mm = m[m["motm_name"].notnull()].copy()
+        # normalize names for leaderboard consistency
+        mm["motm_norm"] = mm["motm_name"].map(normalize_to_full_name)
+        df = mm.groupby("motm_norm", as_index=False).agg(MOTM=("motm_norm","count")).rename(columns={"motm_norm":"Player"})
         st.dataframe(df.sort_values("MOTM", ascending=False), hide_index=True, use_container_width=True)
     else:
         duos = compute_duos(min_games_together=max(2, min_games))
