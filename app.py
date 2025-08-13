@@ -1,18 +1,16 @@
-import io
-import os
-import uuid
-import math
-import time
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+# app.py — Powerleague Stats (Streamlit + Supabase)
+# Mobile-first, admin-only writes, CSV import/export, drag-order lineups, avatars (HEIC→PNG).
+# Includes NaN-safe CSV import fixes and avatar join hot-fix.
 
-import pandas as pd
+import io
+from typing import Tuple, Optional, List
+
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image
 from pillow_heif import read_heif
 from streamlit_sortables import sort_items
-
 from supabase import create_client, Client
 
 # -----------------------
@@ -47,10 +45,13 @@ def is_admin() -> bool:
 
 def admin_gate():
     if is_admin():
-        st.success("Admin mode")
-        if st.button("Sign out", key="btn_signout"):
-            st.session_state["is_admin"] = False
-            st.rerun()
+        c1, c2 = st.columns([1,3])
+        with c1:
+            st.success("Admin mode")
+        with c2:
+            if st.button("Sign out", key="btn_signout"):
+                st.session_state["is_admin"] = False
+                st.rerun()
         return True
     pw = st.text_input("Admin password", type="password", key="admin_pw")
     if st.button("Enter admin", key="btn_admin_enter"):
@@ -65,11 +66,43 @@ def admin_gate():
 # -----------------------
 # Helpers & Caching
 # -----------------------
+def _nan_to_none(v):
+    """Normalize pandas NaN/empty strings to None for JSON encoding."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and np.isnan(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, str) and v.strip() == "":
+        return None
+    return v
+
+def _to_int(v, default=0):
+    v = _nan_to_none(v)
+    if v is None or v == "":
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+def _to_bool(v, default=False):
+    v = _nan_to_none(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int,)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true","1","t","yes","y")
+    return bool(default)
+
 @st.cache_data(ttl=60)
 def fetch_players_df() -> pd.DataFrame:
     res = sb_read.table("players").select("*").order("name").execute()
     df = pd.DataFrame(res.data or [])
-    if not len(df):
+    if df.empty:
         df = pd.DataFrame(columns=["id","name","photo_url","notes"])
     return df
 
@@ -77,16 +110,21 @@ def fetch_players_df() -> pd.DataFrame:
 def fetch_matches_df() -> pd.DataFrame:
     res = sb_read.table("matches").select("*").order("season").order("gw").execute()
     df = pd.DataFrame(res.data or [])
-    if not len(df):
-        df = pd.DataFrame(columns=["id","season","gw","side_count","team_a","team_b","score_a","score_b","date","motm_name","is_draw","formation_a","formation_b","notes"])
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "id","season","gw","side_count","team_a","team_b","score_a","score_b",
+            "date","motm_name","is_draw","formation_a","formation_b","notes"])
     return df
 
 @st.cache_data(ttl=60)
 def fetch_lineups_by_match(match_id: str) -> pd.DataFrame:
-    res = sb_read.table("lineups").select("*").eq("match_id", match_id).order("team").order("line").order("slot").execute()
+    res = sb_read.table("lineups").select("*").eq("match_id", match_id)\
+        .order("team").order("line").order("slot").execute()
     df = pd.DataFrame(res.data or [])
-    if not len(df):
-        df = pd.DataFrame(columns=["id","season","gw","match_id","team","player_id","player_name","is_gk","goals","assists","line","slot","position"])
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "id","season","gw","match_id","team","player_id","player_name","is_gk",
+            "goals","assists","line","slot","position"])
     return df
 
 @st.cache_data(ttl=60)
@@ -116,14 +154,11 @@ def _image_bytes_from_upload(file) -> Tuple[bytes, str]:
     name = file.name.lower()
     if name.endswith(".heic") or name.endswith(".heif"):
         heif = read_heif(file.read())
-        img = Image.frombytes(
-            heif.mode, heif.size, heif.data, "raw"
-        )
+        img = Image.frombytes(heif.mode, heif.size, heif.data, "raw")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue(), "image/png"
     else:
-        # Pillow will verify
         img = Image.open(file)
         buf = io.BytesIO()
         img.save(buf, format="PNG")  # normalize to PNG
@@ -137,7 +172,9 @@ def upload_avatar(player_id: str, file) -> Optional[str]:
         sb_write.storage.from_(AVATAR_BUCKET).remove([path])
     except Exception:
         pass
-    res = sb_write.storage.from_(AVATAR_BUCKET).upload(path, content, {"content-type": mime, "upsert": True})
+    res = sb_write.storage.from_(AVATAR_BUCKET).upload(
+        path, content, {"content-type": mime, "upsert": True}
+    )
     if hasattr(res, "error") and res.error:
         st.error(f"Upload error: {res.error}")
         return None
@@ -148,84 +185,98 @@ def upload_avatar(player_id: str, file) -> Optional[str]:
 # CSV Import / Export (Admin)
 # -----------------------
 def upsert_players(df: pd.DataFrame):
-    # columns: name, photo_url, notes
+    """
+    Import players.csv with NaN-safe normalization.
+    columns: name, photo_url, notes
+    Upsert by unique(name); update photo_url/notes when provided.
+    """
     rows = []
     for _, r in df.iterrows():
-        name = (r.get("name") or "").strip()
+        name = _nan_to_none(r.get("name"))
         if not name:
             continue
         rows.append({
-            "name": name,
-            "photo_url": r.get("photo_url") or None,
-            "notes": r.get("notes") or None
+            "name": str(name).strip(),
+            "photo_url": _nan_to_none(r.get("photo_url")),
+            "notes": _nan_to_none(r.get("notes")),
         })
     if not rows:
         return
-    # upsert by unique(name)
     sb_write.table("players").upsert(rows, on_conflict="name").execute()
     clear_cache()
 
 def upsert_matches(df: pd.DataFrame):
-    # columns: season,gw,side_count,team_a,team_b,score_a,score_b,date,motm_name,is_draw,formation_a,formation_b,notes
-    coerce_bools = lambda v: bool(v) if isinstance(v, (bool, np.bool_)) else (str(v).lower()=="true")
+    """
+    Import matches.csv with NaN-safe normalization.
+    columns: season,gw,side_count,team_a,team_b,score_a,score_b,date,motm_name,is_draw,formation_a,formation_b,notes
+    Upsert by unique(season,gw).
+    """
     rows = []
     for _, r in df.iterrows():
         rows.append({
-            "season": int(r["season"]),
-            "gw": int(r["gw"]),
-            "side_count": int(r["side_count"]),
-            "team_a": r.get("team_a") or "Non-bibs",
-            "team_b": r.get("team_b") or "Bibs",
-            "score_a": int(r.get("score_a") or 0),
-            "score_b": int(r.get("score_b") or 0),
-            "date": r.get("date") or None,
-            "motm_name": r.get("motm_name") or None,
-            "is_draw": coerce_bools(r.get("is_draw", False)),
-            "formation_a": r.get("formation_a") or None,
-            "formation_b": r.get("formation_b") or None,
-            "notes": r.get("notes") or None,
+            "season": _to_int(r.get("season")),
+            "gw": _to_int(r.get("gw")),
+            "side_count": _to_int(r.get("side_count"), default=5),
+            "team_a": (_nan_to_none(r.get("team_a")) or "Non-bibs"),
+            "team_b": (_nan_to_none(r.get("team_b")) or "Bibs"),
+            "score_a": _to_int(r.get("score_a")),
+            "score_b": _to_int(r.get("score_b")),
+            "date": _nan_to_none(r.get("date")),  # can be None/blank
+            "motm_name": _nan_to_none(r.get("motm_name")),
+            "is_draw": _to_bool(r.get("is_draw"), default=False),
+            "formation_a": _nan_to_none(r.get("formation_a")),
+            "formation_b": _nan_to_none(r.get("formation_b")),
+            "notes": _nan_to_none(r.get("notes")),
         })
     if rows:
         sb_write.table("matches").upsert(rows, on_conflict="season,gw").execute()
         clear_cache()
 
 def insert_lineups(df: pd.DataFrame):
-    # columns: season,gw,team,player_name,is_gk,goals,assists,line,slot,position
+    """
+    Import lineups.csv with delete-then-insert per (season,gw,team).
+    columns: season,gw,team,player_name,is_gk,goals,assists,line,slot,position
+    """
     players_df = fetch_players_df()
     matches_df = fetch_matches_df()
     name_to_id = dict(zip(players_df["name"], players_df["id"]))
+
     # normalize names via alias map
+    df = df.copy()
     df["player_name"] = df["player_name"].astype(str).map(lambda x: ALIAS.get(x, x))
+
     # group by season, gw, team for delete-then-insert
     for (season, gw, team), sub in df.groupby(["season","gw","team"]):
-        season = int(season); gw = int(gw)
-        match_row = matches_df[(matches_df["season"]==season) & (matches_df["gw"]==gw)]
+        season_i = _to_int(season); gw_i = _to_int(gw)
+        match_row = matches_df[(matches_df["season"]==season_i) & (matches_df["gw"]==gw_i)]
         if match_row.empty:
-            st.error(f"Missing match for season {season} GW {gw} (cannot import lineups).")
+            st.error(f"Missing match for season {season_i} GW {gw_i} (cannot import lineups).")
             continue
         match_id = match_row.iloc[0]["id"]
-        # delete existing
-        sb_write.table("lineups").delete().eq("match_id", match_id).eq("team", team).execute()
+        # delete existing for that match/team
+        sb_write.table("lineups").delete().eq("match_id", match_id).eq("team", str(team)).execute()
         rows = []
         for _, r in sub.iterrows():
-            pname = str(r["player_name"])
+            pname = str(_nan_to_none(r.get("player_name")) or "")
+            if not pname:
+                continue
             pid = name_to_id.get(pname)
             if not pid:
                 st.warning(f"Player '{pname}' not found in players table. Skipping.")
                 continue
             rows.append({
-                "season": season,
-                "gw": gw,
+                "season": season_i,
+                "gw": gw_i,
                 "match_id": match_id,
-                "team": team,
+                "team": str(team),
                 "player_id": pid,
                 "player_name": pname,
-                "is_gk": bool(int(r.get("is_gk",0))),
-                "goals": int(r.get("goals",0)),
-                "assists": int(r.get("assists",0)),
-                "line": int(r.get("line",1)),
-                "slot": int(r.get("slot",1)),
-                "position": r.get("position") or None
+                "is_gk": _to_bool(r.get("is_gk"), default=False),
+                "goals": _to_int(r.get("goals")),
+                "assists": _to_int(r.get("assists")),
+                "line": _to_int(r.get("line"), default=1),
+                "slot": _to_int(r.get("slot"), default=1),
+                "position": _nan_to_none(r.get("position"))
             })
         if rows:
             sb_write.table("lineups").insert(rows).execute()
@@ -246,17 +297,19 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
     # Render a simple 2-line pitch: GK line (single), then outfield sorted by slot
     gk = team_df[team_df["is_gk"]==True]
     out = team_df[team_df["is_gk"]==False].sort_values(["line","slot","player_name"])
+
     def chip(g,a):
         chips=[]
         if g>0: chips.append(f"⚽x{g}")
         if a>0: chips.append(f"🅰️x{a}")
         return "  ".join(chips)
+
     # GK
     for _, r in gk.iterrows():
         star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
         col = st.container()
         with col:
-            row = st.columns([1,5])
+            row = st.columns([1,5], vertical_alignment="center")
             with row[0]:
                 if photos_on and r.get("photo_url"):
                     st.image(r["photo_url"], width=56)
@@ -268,7 +321,7 @@ def fotmob_pitch(team_df: pd.DataFrame, photos_on: bool, motm_name: Optional[str
     # Outfield
     for _, r in out.iterrows():
         star = " ⭐" if (motm_name and str(r["player_name"])==motm_name) else ""
-        row = st.columns([1,5])
+        row = st.columns([1,5], vertical_alignment="center")
         with row[0]:
             if photos_on and r.get("photo_url"):
                 st.image(r["photo_url"], width=48)
@@ -283,7 +336,10 @@ def match_selector():
     if matches.empty:
         st.info("No matches yet.")
         return None
-    options = matches.apply(lambda r: f"S{r['season']} GW{int(r['gw'])} — {r['team_a']} {r['score_a']}–{r['score_b']} {r['team_b']}", axis=1).tolist()
+    options = matches.apply(
+        lambda r: f"S{r['season']} GW{int(r['gw'])} — {r['team_a']} {r['score_a']}–{r['score_b']} {r['team_b']}",
+        axis=1
+    ).tolist()
     choice = st.selectbox("Select match", options, key="match_select")
     idx = options.index(choice)
     return matches.iloc[idx]
@@ -296,7 +352,8 @@ def compute_player_stats(season: Optional[int]=None, last_gw: Optional[int]=None
     if season:
         matches = matches[matches["season"]==season]
     if last_gw:
-        matches = matches[matches["gw"]>matches["gw"].max()-last_gw]
+        max_gw = matches["gw"].max() if not matches.empty else 0
+        matches = matches[matches["gw"]>max_gw-last_gw]
     mids = matches["id"].tolist()
     ln = []
     for mid in mids:
@@ -315,6 +372,7 @@ def compute_player_stats(season: Optional[int]=None, last_gw: Optional[int]=None
     if not ln:
         return pd.DataFrame()
     L = pd.concat(ln, ignore_index=True)
+
     # team result per row
     def result(row):
         if row["team"] == row["team_a"]:
@@ -324,10 +382,12 @@ def compute_player_stats(season: Optional[int]=None, last_gw: Optional[int]=None
         if bool(row["is_draw"]) or a==b:
             return "D"
         return "W" if a>b else "L"
+
     L["result"] = L.apply(result, axis=1)
     # goals per team (for contribution%)
     team_goals = L.groupby(["season","gw","team"], as_index=False)["goals"].sum().rename(columns={"goals":"team_goals"})
     L = L.merge(team_goals, on=["season","gw","team"], how="left")
+
     agg = L.groupby(["player_id","player_name"], as_index=False).agg(
         GP=("match_id","nunique"),
         W=("result", lambda s: (s=="W").sum()),
@@ -350,7 +410,7 @@ def compute_player_stats(season: Optional[int]=None, last_gw: Optional[int]=None
 def compute_duos(min_games_together=3):
     # duo performance when two players appear on same team in a match
     matches = fetch_matches_df()
-    L_all = []
+    L_all: List[tuple] = []
     for _, m in matches.iterrows():
         lid = m["id"]
         df = fetch_lineups_by_match(lid)
@@ -360,14 +420,13 @@ def compute_duos(min_games_together=3):
             t = df[df["team"]==team]
             ids = t["player_id"].tolist()
             names = t["player_name"].tolist()
-            if len(ids) < 2: 
+            if len(ids) < 2:
                 continue
             # team result
             a, b = int(m["score_a"]), int(m["score_b"])
             team_score = a if team==m["team_a"] else b
             opp_score = b if team==m["team_a"] else a
             res = "D" if (bool(m["is_draw"]) or team_score==opp_score) else ("W" if team_score>opp_score else "L")
-            # accumulate pairs
             for i in range(len(ids)):
                 for j in range(i+1, len(ids)):
                     L_all.append((ids[i], names[i], ids[j], names[j], res))
@@ -392,7 +451,7 @@ def page_overview():
     matches = fetch_matches_df()
     players = fetch_players_df()
     if matches.empty:
-        st.info("Import CSVs to get started (Admin → Import).")
+        st.info("No matches yet. Import CSVs (Admin → Import).")
         return
     total_matches = len(matches)
     total_goals = (matches["score_a"].astype(int) + matches["score_b"].astype(int)).sum()
@@ -425,6 +484,8 @@ def page_overview():
 def page_matches():
     st.header("Matches")
     tab1, tab2, tab3 = st.tabs(["Summary", "Add/Edit", "Export"])
+
+    # --- Summary ---
     with tab1:
         m = match_selector()
         if m is not None:
@@ -432,17 +493,15 @@ def page_matches():
             st.caption(f"{m['team_a']} vs {m['team_b']} · Score: {m['score_a']}–{m['score_b']}")
             st.caption(f"MOTM: {m.get('motm_name') or '—'}  ·  {'Draw' if m.get('is_draw') else 'Result'}")
             photos_on = st.toggle("Show photos", value=True, key="pitch_photos_on")
-            # fetch lineups + join photos (HOT-FIX applied: join by player_id -> players.id)
+            # fetch lineups + join photos (HOT-FIX: join by player_id -> players.id)
             L = fetch_lineups_by_match(m["id"])
             if L.empty:
                 st.info("No lineups yet.")
             else:
                 P = fetch_players_df()[["id","photo_url"]]
                 L = L.merge(P, left_on="player_id", right_on="id", how="left", suffixes=("", "_player"))
-                try:
+                if "id_player" in L.columns:
                     L = L.drop(columns=["id_player"])
-                except Exception:
-                    pass
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("### Non-bibs")
@@ -451,10 +510,12 @@ def page_matches():
                     st.markdown("### Bibs")
                     fotmob_pitch(L[L["team"]=="Bibs"], photos_on, m.get("motm_name"))
 
+    # --- Add/Edit ---
     with tab2:
-        if not admin_gate(): 
+        if not admin_gate():
             st.info("Admin only.")
             return
+
         st.subheader("Add Match")
         season = st.number_input("Season", min_value=2024, max_value=2100, value=2025, step=1, key="add_season")
         gw = st.number_input("Gameweek", min_value=1, max_value=200, value=1, step=1, key="add_gw")
@@ -520,9 +581,9 @@ def page_matches():
         st.subheader("Edit Match")
         m = match_selector()
         if m is not None:
-            st.caption("Inline edit goals/assists, GK toggle, formations & MOTM.")
+            st.caption("Inline edit formations, GK, goals/assists, score, MOTM. Save without breaking stats.")
             la = fetch_lineups_by_match(m["id"]).sort_values(["team","line","slot"])
-            # editable table-like controls
+
             for team in ["Non-bibs","Bibs"]:
                 st.markdown(f"### {team}")
                 tdf = la[la["team"]==team].copy()
@@ -537,6 +598,7 @@ def page_matches():
                         st.number_input("A", min_value=0, value=int(r["assists"]), key=f"a_{r['id']}")
                     with c[3]:
                         st.number_input("Slot", min_value=1, value=int(r["slot"]), key=f"s_{r['id']}")
+
             # match meta
             m_motm = st.text_input("MOTM name", value=m.get("motm_name") or "", key="edit_motm")
             m_form_a = st.text_input("Formation A", value=m.get("formation_a") or "", key="edit_fa")
@@ -544,30 +606,22 @@ def page_matches():
             score_a = st.number_input("Score A", min_value=0, value=int(m["score_a"]), key="edit_sa")
             score_b = st.number_input("Score B", min_value=0, value=int(m["score_b"]), key="edit_sb")
             is_draw = st.checkbox("Draw", value=bool(m.get("is_draw")), key="edit_draw")
+
             if st.button("Save changes", key="btn_save_edit"):
                 # update lineups
                 la = fetch_lineups_by_match(m["id"])
-                updates=[]
                 for _, r in la.iterrows():
-                    updates.append({
-                        "id": r["id"],
-                        "is_gk": st.session_state.get(f"gk_{r['id']}"),
+                    sb_write.table("lineups").update({
+                        "is_gk": bool(st.session_state.get(f"gk_{r['id']}")),
                         "goals": int(st.session_state.get(f"g_{r['id']}")),
                         "assists": int(st.session_state.get(f"a_{r['id']}")),
                         "slot": int(st.session_state.get(f"s_{r['id']}")),
-                    })
-                for u in updates:
-                    sb_write.table("lineups").update({
-                        "is_gk": u["is_gk"],
-                        "goals": u["goals"],
-                        "assists": u["assists"],
-                        "slot": u["slot"],
-                    }).eq("id", u["id"]).execute()
+                    }).eq("id", r["id"]).execute()
                 # update match
                 sb_write.table("matches").update({
-                    "motm_name": m_motm or None,
-                    "formation_a": m_form_a or None,
-                    "formation_b": m_form_b or None,
+                    "motm_name": (m_motm or None),
+                    "formation_a": (m_form_a or None),
+                    "formation_b": (m_form_b or None),
                     "score_a": int(score_a),
                     "score_b": int(score_b),
                     "is_draw": bool(is_draw)
@@ -575,6 +629,8 @@ def page_matches():
                 clear_cache()
                 st.success("Saved.")
                 st.rerun()
+
+    # --- Export ---
     with tab3:
         st.subheader("Export CSV")
         export_table_csv("players", "players_export.csv")
@@ -587,29 +643,64 @@ def page_players():
     players = fetch_players_df()
     if players.empty:
         st.info("No players yet.")
-        return
-    # Gallery
-    for _, r in players.iterrows():
-        with st.container():
-            row = st.columns([1,3,2])
-            with row[0]:
-                if r.get("photo_url"):
-                    st.image(r["photo_url"], width=72)
-                else:
-                    st.markdown("🧑‍🎤")
-            with row[1]:
-                st.markdown(f"**{r['name']}**")
-                st.caption(r.get("notes") or "")
-            with row[2]:
+    else:
+        # Gallery + admin edit controls
+        for _, r in players.iterrows():
+            with st.container():
+                row = st.columns([1,3,3,2])
+                with row[0]:
+                    if r.get("photo_url"):
+                        st.image(r["photo_url"], width=72)
+                    else:
+                        st.markdown("🧑‍🎤")
+                with row[1]:
+                    st.markdown(f"**{r['name']}**")
+                    st.caption(r.get("notes") or "")
                 if is_admin():
-                    up = st.file_uploader(f"Upload avatar ({r['name']})", type=["png","jpg","jpeg","heic","heif"], key=f"up_{r['id']}")
-                    if up:
-                        url = upload_avatar(r["id"], up)
-                        if url:
-                            sb_write.table("players").update({"photo_url": url}).eq("id", r["id"]).execute()
-                            clear_cache()
-                            st.success("Avatar updated.")
-                            st.rerun()
+                    with row[2]:
+                        with st.expander("Edit player", expanded=False):
+                            new_name = st.text_input("Name", value=r["name"], key=f"pname_{r['id']}")
+                            new_notes = st.text_area("Notes", value=r.get("notes") or "", key=f"pnotes_{r['id']}")
+                            if st.button("Save", key=f"psave_{r['id']}"):
+                                sb_write.table("players").update({
+                                    "name": new_name.strip(),
+                                    "notes": (new_notes or None)
+                                }).eq("id", r["id"]).execute()
+                                clear_cache()
+                                st.success("Updated.")
+                                st.rerun()
+                            if st.button("Delete player", key=f"pdel_{r['id']}"):
+                                # Cascades will delete their lineups
+                                sb_write.table("players").delete().eq("id", r["id"]).execute()
+                                clear_cache()
+                                st.warning("Deleted.")
+                                st.rerun()
+                    with row[3]:
+                        up = st.file_uploader(f"Avatar ({r['name']})", type=["png","jpg","jpeg","heic","heif"], key=f"up_{r['id']}")
+                        if up:
+                            url = upload_avatar(r["id"], up)
+                            if url:
+                                sb_write.table("players").update({"photo_url": url}).eq("id", r["id"]).execute()
+                                clear_cache()
+                                st.success("Avatar updated.")
+                                st.rerun()
+    if is_admin():
+        st.divider()
+        st.subheader("Add new player")
+        new_p = st.text_input("Player name", key="new_player_name")
+        new_notes = st.text_input("Notes (optional)", key="new_player_notes")
+        if st.button("Add player", key="btn_add_player") and new_p.strip():
+            try:
+                sb_write.table("players").insert({
+                    "name": new_p.strip(),
+                    "notes": (new_notes or None),
+                    "photo_url": None
+                }).execute()
+                clear_cache()
+                st.success("Player added.")
+                st.rerun()
+            except Exception as e:
+                st.error("Could not add player (duplicate name?)")
 
 def page_stats():
     st.header("Stats")
@@ -623,7 +714,7 @@ def page_stats():
         st.info("No data.")
         return
     mode = st.selectbox("Leaderboard", ["Top scorers","Top assisters","Top G+A","Team Contribution%","MOTM","Best duos (win%)","Worst duos (win%)"], key="stats_mode")
-    show_photos = st.toggle("Show photos", value=False, key="stats_photos")
+    st.toggle("Show photos", value=False, key="stats_photos")  # placeholder toggle; dense tables by default
 
     if mode in ["Top scorers","Top assisters","Top G+A","Team Contribution%"]:
         if mode == "Top scorers":
